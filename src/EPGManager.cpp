@@ -320,6 +320,21 @@ bool EPGManager::GetEPGTagStreamProperties(const kodi::addon::PVREPGTag& tag,
   nlohmann::json document;
   if (!parseJson(response, document) || !document.is_object()) return false;
 
+  // Not-yet-aired programme: Kodi auto-advances here at the end of a running catchup
+  // programme. There's no catchup content for a future slot, so play the live channel
+  // and flag it as live so Kodi's OSD/EPG follows the current programme instead of
+  // labelling playback with this future entry.
+  if (tag.GetStartTime() > std::time(nullptr)) {
+    if (!document.contains("manifest_url") || !document["manifest_url"].is_string()) {
+      return false;
+    }
+    properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.adaptive");
+    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL,
+                            document["manifest_url"].get<std::string>());
+    properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "true");
+    return true;
+  }
+
   if (!document.contains("catchup_stream_url_template") ||
       !document["catchup_stream_url_template"].is_string()) {
     kodi::Log(ADDON_LOG_WARNING,
