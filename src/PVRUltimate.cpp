@@ -72,10 +72,48 @@ CPVRUltimate::CPVRUltimate()
   // doing this synchronously in the constructor could block for close to two
   // minutes, which risks Kodi's own watchdog marking the addon unresponsive.
   m_initThread = std::thread(&CPVRUltimate::InitializeAsync, this);
+  m_timerPollThread = std::thread(&CPVRUltimate::TimerPollLoop, this);
+}
+
+void CPVRUltimate::TimerPollLoop() {
+  constexpr auto kInterval = std::chrono::seconds(30);
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(m_timerPollMutex);
+      if (m_timerPollCv.wait_for(lock, kInterval, [this] { return m_stopTimerPoll.load(); })) return;
+    }
+    if (!IsReady()) continue;
+
+    // Only worth polling while something is pending or running.
+    const std::string before = m_timerManager->StateSignature();
+    if (before.empty()) continue;
+
+    auto httpGet = [this](const std::string& endpoint) -> std::string {
+      return this->HttpGet(this->BuildApiUrl(endpoint));
+    };
+    auto parseJson = [](const std::string& response, nlohmann::json& doc) -> bool {
+      return Utils::ParseJsonResponse(response, doc);
+    };
+    m_timerManager->LoadTimers(m_providerManager->GetProviders(), httpGet, parseJson);
+
+    if (before != m_timerManager->StateSignature()) {
+      kodi::Log(ADDON_LOG_INFO, "Timer state changed, notifying Kodi");
+      TriggerTimerUpdate();
+      TriggerRecordingUpdate();
+    }
+  }
 }
 
 CPVRUltimate::~CPVRUltimate() {
   kodi::Log(ADDON_LOG_INFO, "Ultimate PVR Client stopping...");
+  {
+    std::lock_guard<std::mutex> lock(m_timerPollMutex);
+    m_stopTimerPoll = true;
+  }
+  m_timerPollCv.notify_all();
+  if (m_timerPollThread.joinable()) {
+    m_timerPollThread.join();
+  }
   EnsureInitThreadStopped();
   if (m_initThread.joinable()) {
     m_initThread.join();
@@ -387,7 +425,9 @@ std::string CPVRUltimate::BuildApiUrl(const std::string& endpoint) {
   return url.str();
 }
 
-std::string CPVRUltimate::HttpSendRequest(const std::string& url, const std::string& method, const std::string& body) {
+std::string CPVRUltimate::HttpSendRequest(const std::string& url, const std::string& method, const std::string& body,
+                                          bool* opened) {
+  if (opened) *opened = false;
   kodi::Log(ADDON_LOG_DEBUG, "HTTP %s: %s", method.c_str(), Utils::RedactUrl(url).c_str());
 
   std::string apiKey, customHeaders;
@@ -466,6 +506,7 @@ std::string CPVRUltimate::HttpSendRequest(const std::string& url, const std::str
     kodi::Log(ADDON_LOG_ERROR, "Failed to open URL: %s", Utils::RedactUrl(url).c_str());
     return "";
   }
+  if (opened) *opened = true;
 
   std::string content;
   char buffer[16384]; // Increased from 1024 for better performance
@@ -500,8 +541,9 @@ std::string CPVRUltimate::HttpGetNoRetry(const std::string& url) {
 }
 
 bool CPVRUltimate::HttpDelete(const std::string& url) {
-  std::string resp = HttpSendRequest(url, "DELETE", "");
-  if (resp.empty()) {
+  bool opened = false;
+  HttpSendRequest(url, "DELETE", "", &opened);
+  if (!opened) {
     kodi::Log(ADDON_LOG_ERROR, "HTTP DELETE failed: %s", Utils::RedactUrl(url).c_str());
     return false;
   }
@@ -509,8 +551,9 @@ bool CPVRUltimate::HttpDelete(const std::string& url) {
 }
 
 bool CPVRUltimate::HttpPost(const std::string& url, const std::string& body) {
-  std::string resp = HttpSendRequest(url, "POST", body);
-  if (resp.empty()) {
+  bool opened = false;
+  HttpSendRequest(url, "POST", body, &opened);
+  if (!opened) {
     kodi::Log(ADDON_LOG_ERROR, "HTTP POST failed: %s", Utils::RedactUrl(url).c_str());
     return false;
   }
@@ -518,8 +561,9 @@ bool CPVRUltimate::HttpPost(const std::string& url, const std::string& body) {
 }
 
 bool CPVRUltimate::HttpPut(const std::string& url, const std::string& body) {
-  std::string resp = HttpSendRequest(url, "PUT", body);
-  if (resp.empty()) {
+  bool opened = false;
+  HttpSendRequest(url, "PUT", body, &opened);
+  if (!opened) {
     kodi::Log(ADDON_LOG_ERROR, "HTTP PUT failed: %s", Utils::RedactUrl(url).c_str());
     return false;
   }
@@ -1048,6 +1092,16 @@ PVR_ERROR CPVRUltimate::GetRecordingsAmount(bool deleted, int& amount) {
 
 PVR_ERROR CPVRUltimate::GetRecordings(bool deleted, kodi::addon::PVRRecordingsResultSet& results) {
   if (!IsReady()) return PVR_ERROR_NO_ERROR;
+
+  // Refresh first: recordings appear (and change status) while Kodi is running.
+  auto httpGet = [this](const std::string& endpoint) -> std::string {
+    return this->HttpGet(this->BuildApiUrl(endpoint));
+  };
+  auto parseJson = [](const std::string& response, nlohmann::json& doc) -> bool {
+    return Utils::ParseJsonResponse(response, doc);
+  };
+  m_recordingManager->LoadRecordings(m_providerManager->GetProviders(), httpGet, parseJson);
+
   m_recordingManager->GetRecordings(deleted, results);
   return PVR_ERROR_NO_ERROR;
 }
@@ -1143,7 +1197,24 @@ PVR_ERROR CPVRUltimate::GetTimersAmount(int& amount) {
 
 PVR_ERROR CPVRUltimate::GetTimers(kodi::addon::PVRTimersResultSet& results) {
   if (!IsReady()) return PVR_ERROR_NO_ERROR;
-  m_timerManager->GetTimers(results);
+
+  // Providers change timer state on their own (a scheduled timer starts recording
+  // by itself), so serve a fresh list instead of the copy from startup. Kodi polls
+  // this periodically.
+  auto httpGet = [this](const std::string& endpoint) -> std::string {
+    return this->HttpGet(this->BuildApiUrl(endpoint));
+  };
+  auto parseJson = [](const std::string& response, nlohmann::json& doc) -> bool {
+    return Utils::ParseJsonResponse(response, doc);
+  };
+  const std::string before = m_timerManager->StateSignature();
+  m_timerManager->LoadTimers(m_providerManager->GetProviders(), httpGet, parseJson);
+  const bool changed = before != m_timerManager->StateSignature();
+
+  m_timerManager->GetTimers(results, m_channelManager->GetLookup());
+
+  // A timer that started or finished also changes the recordings list.
+  if (changed) TriggerRecordingUpdate();
   return PVR_ERROR_NO_ERROR;
 }
 
@@ -1166,12 +1237,29 @@ PVR_ERROR CPVRUltimate::AddTimer(const kodi::addon::PVRTimer& timer) {
     m_timerManager->LoadTimers(providers, httpGet, parseJson);
   };
 
+  auto httpGetEp = [this](const std::string& endpoint) -> std::string {
+    return this->HttpGet(this->BuildApiUrl(endpoint));
+  };
+  auto parseJsonFn = [](const std::string& response, nlohmann::json& doc) -> bool {
+    return Utils::ParseJsonResponse(response, doc);
+  };
+
   if (!m_timerManager->AddTimer(timer, m_providerManager->GetProviders(),
                                 m_channelManager->GetLookup(),
-                                buildApiUrl, httpPost, loadTimers)) {
+                                buildApiUrl, httpPost, loadTimers, httpGetEp, parseJsonFn)) {
+    // Kodi only says "server error". The HTTP layer does not expose the reason of a
+    // failed request, so name the most common cause (the provider refuses a
+    // broadcast that was already recorded or deleted) without claiming certainty.
+    kodi::QueueNotification(QUEUE_ERROR, "PVR Ultimate",
+                            "Timer konnte nicht angelegt werden. Moeglicherweise wurde diese "
+                            "Sendung schon aufgenommen oder geloescht.");
     return PVR_ERROR_SERVER_ERROR;
   }
 
+  // Kodi only re-reads the timer list when the client says it changed.
+  // A timer that is already recording also shows up under recordings.
+  TriggerTimerUpdate();
+  TriggerRecordingUpdate();
   return PVR_ERROR_NO_ERROR;
 }
 
@@ -1197,9 +1285,18 @@ PVR_ERROR CPVRUltimate::DeleteTimer(const kodi::addon::PVRTimer& timer, bool for
   };
 
   if (!m_timerManager->DeleteTimer(clientIndex, forceDelete, buildApiUrl, httpDelete, loadTimers)) {
+    // The timer may already be gone on the provider (e.g. a second delete while the
+    // first, asynchronous one was still being processed). Refresh so Kodi stops
+    // showing a stale entry instead of letting the user hit the same error again.
+    loadTimers();
+    TriggerTimerUpdate();
     return PVR_ERROR_SERVER_ERROR;
   }
 
+  // Kodi only re-reads the timer list when the client says it changed.
+  // A timer that is already recording also shows up under recordings.
+  TriggerTimerUpdate();
+  TriggerRecordingUpdate();
   return PVR_ERROR_NO_ERROR;
 }
 
@@ -1226,6 +1323,10 @@ PVR_ERROR CPVRUltimate::UpdateTimer(const kodi::addon::PVRTimer& timer) {
     return PVR_ERROR_SERVER_ERROR;
   }
 
+  // Kodi only re-reads the timer list when the client says it changed.
+  // A timer that is already recording also shows up under recordings.
+  TriggerTimerUpdate();
+  TriggerRecordingUpdate();
   return PVR_ERROR_NO_ERROR;
 }
 

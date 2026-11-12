@@ -24,14 +24,28 @@ public:
 
   bool GetTimerTypes(std::vector<kodi::addon::PVRTimerType>& types) const;
   int GetTimersAmount() const;
-  bool GetTimers(kodi::addon::PVRTimersResultSet& results) const;
+  // Compact fingerprint of (index,state) of all timers; used to detect state changes
+  // (e.g. SCHEDULED -> RECORDING) across a reload.
+  std::string StateSignature() const;
+  bool GetTimers(kodi::addon::PVRTimersResultSet& results,
+                 const std::map<int, ChannelLookupInfo>& channelLookup = {}) const;
 
   static bool AddTimer(const kodi::addon::PVRTimer& timer,
                        const std::vector<UltimateProvider>& providers,
                        const std::map<int, ChannelLookupInfo>& channelLookup,
                        const std::function<std::string(const std::string&)>& buildApiUrl,
                        const std::function<bool(const std::string&, const std::string&)>& httpPost,
-                       const std::function<void()>& loadTimers);
+                       const std::function<void()>& loadTimers,
+                       const std::function<std::string(const std::string&)>& httpGet = nullptr,
+                       const std::function<bool(const std::string&, nlohmann::json&)>& parseJson = nullptr);
+
+  // Looks up the provider-native listing id (epg_event_id) of the broadcast that
+  // starts at startTime on the given channel by asking the backend's own EPG.
+  // Fallback for when the client-side EPG source did not carry the id.
+  static std::string ResolveEpgEventId(const std::string& provider, const std::string& channelId,
+                                       time_t startTime, time_t endTime,
+                                       const std::function<std::string(const std::string&)>& httpGet,
+                                       const std::function<bool(const std::string&, nlohmann::json&)>& parseJson);
 
   bool DeleteTimer(int clientIndex, bool forceDelete,
                    const std::function<std::string(const std::string&)>& buildApiUrl,
