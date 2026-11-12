@@ -120,6 +120,15 @@ private:
   // into a partially-destroyed object.
   std::thread m_initThread;
   std::thread m_uiThread;  // runs the provider selection dialog off the GUI thread
+
+  // Providers start/finish recordings on their own schedule; Kodi itself only polls
+  // every few minutes. This thread re-reads the timer list at a short interval and
+  // tells Kodi when a timer changed state (e.g. SCHEDULED -> RECORDING).
+  std::thread m_timerPollThread;
+  std::atomic<bool> m_stopTimerPoll{false};
+  std::condition_variable m_timerPollCv;
+  std::mutex m_timerPollMutex;
+  void TimerPollLoop();
   std::atomic<bool> m_stopInit{false};
   std::atomic<bool> m_initRunning{false};
   std::atomic<bool> m_initialized{false};
@@ -150,7 +159,11 @@ private:
   bool HttpPost(const std::string& url, const std::string& body);
 
   bool HttpPut(const std::string& url, const std::string& body);
-  std::string HttpSendRequest(const std::string& url, const std::string& method, const std::string& body);
+  // 'opened' (optional) is set to whether the request itself succeeded. Kodi's CURL
+  // layer fails OpenFile for HTTP >= 400, so opened==true with an empty body is a
+  // legitimate success (e.g. 202/204 No Content).
+  std::string HttpSendRequest(const std::string& url, const std::string& method, const std::string& body,
+                              bool* opened = nullptr);
 
   // Core methods
   bool RetryBackendCall(const std::string& operationName);

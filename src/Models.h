@@ -113,6 +113,9 @@ struct UltimateTimerType {
   int id = 0;
   std::string description;
   int priority = 50;
+  // Backend capability bitmask (TimerTypeAttribute in the backend). 0 = the
+  // backend did not report any, in which case a permissive legacy default is used.
+  unsigned int attributes = 0;
 };
 
 struct UltimateTimer {
@@ -124,6 +127,9 @@ struct UltimateTimer {
   int parentClientIndex = 0;
 
   int clientChannelUid = 0;
+  // Provider-native channel id as delivered by the backend (may exceed 32 bit).
+  // Resolved to a Kodi channel uid (our channel number) when timers are handed to Kodi.
+  std::string providerChannelId;
   std::string channelName;
 
   time_t startTime = 0;
